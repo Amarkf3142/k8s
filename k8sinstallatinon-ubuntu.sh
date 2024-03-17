@@ -10,3 +10,10 @@ sudo apt-get install -y kubelet kubeadm kubectl
 sudo apt-mark hold kubelet kubeadm kubectl
 
 kubeadm init
+
+#install docker
+
+sudo apt install docker.io -y
+
+systemctl start docker
+systemctl enable docker
