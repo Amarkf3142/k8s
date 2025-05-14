@@ -1,0 +1,160 @@
+import csv
+import boto3
+import json
+
+def main(credentials_file, start_date, end_date):
+    with open(credentials_file, 'r') as file:
+        credentials_list = file.readlines()
+    
+    for credentials in credentials_list:
+        access_key, secret_key, account_id, account_name = credentials.strip().split('\t')
+        print(f"Processing account: {account_id} ({account_name})")
+        
+        # Create a session for the current account
+        session = boto3.Session(
+            aws_access_key_id=access_key,
+            aws_secret_access_key=secret_key
+        )
+        
+        # Fetch instance details
+        ec2_client = session.client('ec2')
+        instance_list = get_all_ec2_instances(ec2_client)
+        
+        # Fetch costs for each instance
+        ce_client = session.client('ce')
+        server_cost_list = []
+        for instance in instance_list:
+            instance_cost = cost_explorer_call(ce_client, start_date, end_date, instance['server_name'])
+            cost = {
+                'AccountID': account_id,
+                'AccountName': account_name,
+                'HostName': instance['server_name'],
+                'InstanceId': instance['instance_id'],
+                'InstanceType': instance['instance_type'],
+                'DataTransferCost': 0,
+                'DataTransfer': 0,
+                'EBSVolumeUsageCost': 0,
+                'EBSVolumeUsage': 0,
+                'InstanceCost': 0,
+                'SnapshotCost': 0,
+                'SnapshotUsage': 0,
+                'Other': 0
+            }
+            
+            for items in instance_cost:
+                key = items['Keys'][0]
+                if 'Out-Bytes' in key or 'Regional-Bytes' in key:
+                    cost['DataTransferCost'] += float(items['Metrics']['UnblendedCost']['Amount'])
+                    cost['DataTransfer'] += float(items['Metrics']['UsageQuantity']['Amount'])
+                elif 'BoxUsage' in key:
+                    cost['InstanceCost'] += float(items['Metrics']['UnblendedCost']['Amount'])
+                elif 'SnapshotUsage' in key:
+                    cost['SnapshotCost'] += float(items['Metrics']['UnblendedCost']['Amount'])
+                    cost['SnapshotUsage'] += float(items['Metrics']['UsageQuantity']['Amount'])
+                elif 'EBS:VolumeUsage' in key:
+                    cost['EBSVolumeUsageCost'] += float(items['Metrics']['UnblendedCost']['Amount'])
+                    cost['EBSVolumeUsage'] += float(items['Metrics']['UsageQuantity']['Amount'])
+                else:
+                    cost['Other'] += float(items['Metrics']['UnblendedCost']['Amount'])
+            
+            server_cost_list.append(cost)
+        
+        # Skip if no cost data found
+        if not server_cost_list:
+            print(f"No cost details found for account {account_id} ({account_name}). Skipping file generation.")
+            continue
+
+        # Write the results to a CSV file for the current account
+        output_file = f'instance_costs_{account_id}.csv'
+        write_csv(server_cost_list, output_file)
+        print(f"Cost details for account {account_id} ({account_name}) saved to '{output_file}'")
+
+def get_all_ec2_instances(ec2_client):
+    """Fetch details of all EC2 instances with pagination."""
+    paginator = ec2_client.get_paginator('describe_instances')
+    instance_list = []
+    
+    for page in paginator.paginate():
+        for reservation in page['Reservations']:
+            for instance in reservation['Instances']:
+                server_name = next((tag['Value'] for tag in instance.get('Tags', []) if tag['Key'] == 'Name'), "Unnamed")
+                instance_id = instance['InstanceId']
+                instance_type = instance['InstanceType']
+                
+                instance_list.append({
+                    'server_name': server_name,
+                    'instance_id': instance_id,
+                    'instance_type': instance_type
+                })
+    
+    return instance_list
+
+def cost_explorer_call(ce_client, start_dt, end_dt, server_name):
+    """Fetch cost and usage data for a given server name with manual pagination."""
+    all_groups = []
+    next_token = None
+
+    while True:
+        # If there's a NextPageToken, include it in the request; otherwise, don't include it.
+        request_params = {
+            'TimePeriod': {
+                'Start': start_dt,
+                'End': end_dt
+            },
+            'Granularity': 'MONTHLY',
+            'Filter': {
+                "Tags": {
+                    "Key": "Name",
+                    "Values": [
+                        server_name
+                    ]
+                }
+            },
+            'Metrics': [
+                'UnblendedCost',
+                'UsageQuantity'
+            ],
+            'GroupBy': [
+                {
+                    'Type': 'DIMENSION',
+                    'Key': 'USAGE_TYPE'
+                },
+            ]
+        }
+
+        # Add NextPageToken to request parameters if it exists
+        if next_token:
+            request_params['NextPageToken'] = next_token
+
+        # Make the request
+        response = ce_client.get_cost_and_usage(**request_params)
+
+        all_groups.extend(response['ResultsByTime'][0]['Groups'])
+
+        # Get the NextPageToken for pagination, if it exists
+        next_token = response.get('NextPageToken')
+        
+        # If there's no next token, exit the loop
+        if not next_token:
+            break
+
+    return all_groups
+
+def write_csv(cost_list, output_file):
+    """Write the cost details to a CSV file."""
+    if not cost_list:  # Check if the list is empty
+        print(f"No cost data to write for {output_file}. Skipping...")
+        return
+
+    with open(output_file, 'w', newline='') as file:
+        writer = csv.writer(file)
+        writer.writerow(list(cost_list[0].keys()))  # Write headers
+        for cost in cost_list:
+            writer.writerow(cost.values())
+
+# Example usage
+if __name__ == "__main__":
+    credentials_file = 'aws_credentials.txt'  # File containing access_key, secret_key, account_id, account_name
+    start_date = '2024-11-01'
+    end_date = '2024-12-01'
+    main(credentials_file, start_date, end_date)
